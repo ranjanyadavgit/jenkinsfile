@@ -2,96 +2,64 @@
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 
-/*
-Please make sure to add the following environment variables:
-HEROKU_PREVIEW=<your heroku preview app>
-HEROKU_PREPRODUCTION=<your heroku pre-production app>
-HEROKU_PRODUCTION=<your heroku production app>
+def label = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(label: label, yaml: """
+spec:
+      containers:
+      - name: mvn
+        image: maven:3.3.9-jdk-8-alpine
+        command:
+        - cat
+        tty: true
+        volumeMounts:
+        - mountPath: /cache
+          name: maven-cache
+      volumes:
+      - name: maven-cache
+        hostPath:
+          # directory location on host
+          path: /tmp
+          type: Directory
+""",
+{
+    node (label) {
+      container ('mvn') {
+        // env.JAVA_HOME="${tool 'Java SE DK 8u131'}"
+        // env.PATH="${env.JAVA_HOME}/bin:${env.PATH}"
 
-Please also add the following credentials to the global domain of your organization's folder:
-Heroku API key as secret text with ID 'HEROKU_API_KEY'
-GitHub Token value as secret text with ID 'GITHUB_TOKEN'
-*/
+        server = Artifactory.server "artifactory"
+        buildInfo = Artifactory.newBuildInfo()
+        buildInfo.env.capture = true
 
-node {
-
-     server = Artifactory.server "artifactory"
-     buildInfo = Artifactory.newBuildInfo()
-     buildInfo.env.capture = true
-    
-    // we need to set a newer JVM for Sonar
-    env.JAVA_HOME="${tool 'Java SE DK 8u131'}"
-    env.PATH="${env.JAVA_HOME}/bin:${env.PATH}"
-    
-    // pull request or feature branch
-    if  (env.BRANCH_NAME != 'master') {
-        checkout()
-        build()
-        unitTest()
-        // test whether this is a regular branch build or a merged PR build
-        if (!isPRMergeBuild()) {
-            preview()
-            sonarServer()
-            allCodeQualityTests()
-        } else {
-            // Pull request
-            sonarPreview()
+        // pull request or feature branch
+        if  (env.BRANCH_NAME != 'master') {
+            checkout()
+            build()
+            unitTest()
+            // test whether this is a regular branch build or a merged PR build
+            if (!isPRMergeBuild()) {
+                // maybe disabled for ChatOps
+                preview()
+            } else {
+                // PR-build
+                sonar()
+            }    
+        } // master branch / production
+        else {
+            checkout()
+            build()
+            allTests()
+            preProduction()
+            manualPromotion()
+            production()
         }
-    } // master branch / production
-    else { 
-        checkout()
-        build()
-        allTests()
-        preview()
-        sonarServer()
-        allCodeQualityTests()
-        preProduction()
-        manualPromotion()
-        production()
     }
-}
+ }
+})
 
 def isPRMergeBuild() {
     return (env.BRANCH_NAME ==~ /^PR-\d+$/)
 }
-
-def sonarPreview() {
-    stage('SonarQube Preview') {
-        prNo = (env.BRANCH_NAME=~/^PR-(\d+)$/)[0][1]
-        mvn "org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=true -Pcoverage-per-test"
-        withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
-            githubToken=env.GITHUB_TOKEN
-            repoSlug=getRepoSlug()
-            withSonarQubeEnv('SonarQube Octodemoapps') {
-                mvn "-Dsonar.analysis.mode=preview -Dsonar.github.pullRequest=${prNo} -Dsonar.github.oauth=${githubToken} -Dsonar.github.repository=${repoSlug} -Dsonar.github.endpoint=https://api.github.com/ org.sonarsource.scanner.maven:sonar-maven-plugin:3.2:sonar"
-            }
-        }
-    } 
-}
-    
-def sonarServer() {
-    stage('SonarQube Server') {
-        mvn "org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=true -Pcoverage-per-test"
-        withSonarQubeEnv('SonarQube Octodemoapps') {
-            mvn "org.sonarsource.scanner.maven:sonar-maven-plugin:3.2:sonar"
-        }
-        
-        context="sonarqube/qualitygate"
-        setBuildStatus ("${context}", 'Checking Sonarqube quality gate', 'PENDING')
-        timeout(time: 1, unit: 'MINUTES') { // Just in case something goes wrong, pipeline will be killed after a timeout
-            def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
-            if (qg.status != 'OK') {
-                setBuildStatus ("${context}", "Sonarqube quality gate fail: ${qg.status}", 'FAILURE')
-                error "Pipeline aborted due to quality gate failure: ${qg.status}"
-            } else {
-                setBuildStatus ("${context}", "Sonarqube quality gate pass: ${qg.status}", 'SUCCESS')
-            }    
-        }
-    }
-}
-    
-
-
 
 def checkout () {
     stage 'Checkout code'
@@ -110,9 +78,39 @@ def build () {
 def unitTest() {
     stage 'Unit tests'
     mvn 'test -B -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true'
+    
     if (currentBuild.result == "UNSTABLE") {
         sh "exit 1"
     }
+}
+
+def sonar() {
+    stage('SonarQube analysis') {
+    prNo = (env.BRANCH_NAME=~/^PR-(\d+)$/)[0][1] 
+    echo "PR-No: ${prNo}"
+    // requires SonarQube Scanner 2.8+
+    mvn 'org.jacoco:jacoco-maven-plugin:prepare-agent install -Dmaven.test.failure.ignore=true -Pcoverage-per-test'
+    withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
+        githubToken=env.GITHUB_TOKEN
+        withSonarQubeEnv('SonarQube Octodemoapps') {
+            mvn "-Dsonar.analysis.mode=preview -Dsonar.github.pullRequest=${prNo} -Dsonar.github.oauth=${githubToken} -Dsonar.github.repository=Hyrule/reading-time-app -Dsonar.github.endpoint=https://octodemo.com/api/v3/ org.sonarsource.scanner.maven:sonar-maven-plugin:3.2:sonar"
+            mvn "org.sonarsource.scanner.maven:sonar-maven-plugin:3.2:sonar"
+        }
+    }
+    
+    context="sonarqube/qualitygate"
+    setBuildStatus ("${context}", 'Checking Sonarqube quality gate', 'PENDING')
+    sleep 5
+    timeout(time: 1, unit: 'MINUTES') { // Just in case something goes wrong, pipeline will be killed after a timeout
+        def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+        if (qg.status != 'OK') {
+            setBuildStatus ("${context}", "Sonarqube quality gate fail: ${qg.status}", 'FAILURE')
+            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+        } else {
+            setBuildStatus ("${context}", "Sonarqube quality gate pass: ${qg.status}", 'SUCCESS')
+        }    
+    }
+  }
 }
 
 def allTests() {
@@ -126,65 +124,21 @@ def allTests() {
     }
 }
 
-def allCodeQualityTests() {
-    stage 'Code Quality'
-    lintTest()
-    coverageTest()
-}
-
-def lintTest() {
-    context="continuous-integration/jenkins/linting"
-    setBuildStatus ("${context}", 'Checking code conventions', 'PENDING')
-    lintTestPass = true
-
-    try {
-        mvn 'verify -DskipTests=true'
-    } catch (err) {
-        setBuildStatus ("${context}", 'Some code conventions are broken', 'FAILURE')
-        lintTestPass = false
-    } finally {
-        if (lintTestPass) setBuildStatus ("${context}", 'Code conventions OK', 'SUCCESS')
-    }
-}
-
-def coverageTest() {
-    context="continuous-integration/jenkins/coverage"
-    setBuildStatus ("${context}", 'Checking code coverage levels', 'PENDING')
-
-    coverageTestStatus = true
-
-    try {
-        mvn 'cobertura:check'
-    } catch (err) {
-        setBuildStatus("${context}", 'Code coverage below 90%', 'FAILURE')
-        throw err
-    }
-
-    setBuildStatus ("${context}", 'Code coverage above 90%', 'SUCCESS')
-
-}
-
 def preview() {
-    stage name: 'Deploy to Preview env', concurrency: 1
-    def herokuApp = "${env.HEROKU_PREVIEW}"
-    def id = createDeployment(getBranch(), "preview", "Deploying branch to test")
-    echo "Deployment ID: ${id}"
-    if (id != null) {
-        setDeploymentStatus(id, "pending", "https://${herokuApp}.herokuapp.com/", "Pending deployment to test");
-        herokuDeploy "${herokuApp}"
-        setDeploymentStatus(id, "success", "https://${herokuApp}.herokuapp.com/", "Successfully deployed to test");
-    }
-    mvn 'deploy -DskipTests=true'
+    herokuApp = "${env.HEROKU_PREVIEW}"
+    deployToStage("preview", herokuApp)
+    // mvn 'deploy -DskipTests=true'
 }
 
 def preProduction() {
-    stage name: 'Deploy to Pre-Production', concurrency: 1
     switchSnapshotBuildToRelease()
-    herokuDeploy "${env.HEROKU_PREPRODUCTION}"
+    herokuApp = "${env.HEROKU_PREPRODUCTION}"
+    deployToStage("preproduction", herokuApp)
     buildAndPublishToArtifactory()
 }
 
 def manualPromotion() {
+  stage 'Manual Promotion'
     // we need a first milestone step so that all jobs entering this stage are tracked an can be aborted if needed
     milestone 1
     // time out manual approval after ten minutes
@@ -196,14 +150,44 @@ def manualPromotion() {
 }
 
 def production() {
-    stage name: 'Deploy to Production', concurrency: 1
+    herokuApp = "${env.HEROKU_PRODUCTION}"
     step([$class: 'ArtifactArchiver', artifacts: '**/target/*.jar', fingerprint: true])
-    herokuDeploy "${env.HEROKU_PRODUCTION}"
+    deployToStage("production", herokuApp)
     def version = getCurrentHerokuReleaseVersion("${env.HEROKU_PRODUCTION}")
     def createdAt = getCurrentHerokuReleaseDate("${env.HEROKU_PRODUCTION}", version)
     echo "Release version: ${version}"
     createRelease(version, createdAt)
-    promoteInArtifactoryAndDistributeToBinTray()
+    
+    stage ("Promote in Artifactory") {
+        promoteBuildInArtifactory()
+        // distributeBuildToBinTray()
+    }
+}
+
+void createRelease(tagName, createdAt) {
+    withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
+        def body = "**Created at:** ${createdAt}\n**Deployment job:** [${env.BUILD_NUMBER}](${env.BUILD_URL})\n**Environment:** [${env.HEROKU_PRODUCTION}](https://dashboard.heroku.com/apps/${env.HEROKU_PRODUCTION})"
+        def payload = JsonOutput.toJson(["tag_name": "v${tagName}", "name": "${env.HEROKU_PRODUCTION} - v${tagName}", "body": "${body}"])
+        def apiUrl = "https://octodemo.com/api/v3/repos/${getRepoSlug()}/releases"
+        def response = sh(returnStdout: true, script: "curl -s -H \"Authorization: Token ${env.GITHUB_TOKEN}\" -H \"Accept: application/json\" -H \"Content-type: application/json\" -X POST -d '${payload}' ${apiUrl}").trim()
+    }
+}
+
+def deployToStage(stageName, herokuApp) {
+    stage name: "Deploy to ${stageName}", concurrency: 1
+    id = createDeployment(getBranch(), "${stageName}", "Deploying branch to ${stageName}")
+    echo "Deployment ID for ${stageName}: ${id}"
+    if (id != null) {
+        setDeploymentStatus(id, "pending", "https://${herokuApp}.herokuapp.com/", "Pending deployment to ${stageName}");
+        herokuDeploy "${herokuApp}"
+        setDeploymentStatus(id, "success", "https://${herokuApp}.herokuapp.com/", "Successfully deployed to ${stageName}");
+    }
+}
+
+def herokuDeploy (herokuApp) {
+    withCredentials([[$class: 'StringBinding', credentialsId: 'HEROKU_API_KEY', variable: 'HEROKU_API_KEY']]) {
+        mvn "heroku:deploy -DskipTests=true -Dmaven.javadoc.skip=true -B -V -D heroku.appName=${herokuApp}"
+    }
 }
 
 def switchSnapshotBuildToRelease() {
@@ -215,11 +199,13 @@ def switchSnapshotBuildToRelease() {
 
 def buildAndPublishToArtifactory() {       
         def rtMaven = Artifactory.newMavenBuild()
-        rtMaven.tool = "Maven 3.x"
-        rtMaven.deployer releaseRepo:'libs-release-local', snapshotRepo:'libs-snapshot-local', server: server
-        rtMaven.resolver releaseRepo:'libs-release', snapshotRepo:'libs-snapshot', server: server
-        rtMaven.run pom: 'pom.xml', goals: 'install', buildInfo: buildInfo
-        server.publishBuildInfo buildInfo
+        rtMaven.tool = null
+        withEnv(["MAVEN_HOME=/usr/share/maven"]) {
+           rtMaven.deployer releaseRepo:'libs-release-local', snapshotRepo:'libs-snapshot-local', server: server
+           rtMaven.resolver releaseRepo:'libs-release', snapshotRepo:'libs-snapshot', server: server
+           rtMaven.run pom: 'pom.xml', goals: 'install', buildInfo: buildInfo
+           server.publishBuildInfo buildInfo
+        }
 }
 
 def promoteBuildInArtifactory() {
@@ -261,33 +247,22 @@ def distributeBuildToBinTray() {
         server.distribute distributionConfig
 }
 
-def promoteInArtifactoryAndDistributeToBinTray() {
-    stage ("Promote in Artifactory and Distribute to BinTray") {
-        promoteBuildInArtifactory()
-        distributeBuildToBinTray()
-    }
-}
-
 def mvn(args) {
     withMaven(
-        // Maven installation declared in the Jenkins "Global Tool Configuration"
-        maven: 'Maven 3.x',
-        // Maven settings.xml file defined with the Jenkins Config File Provider Plugin
+        // mavenSettingsConfig: '0e94d6c3-b431-434f-a201-7d7cda7180cb'
         
-        // settings.xml referencing the GitHub Artifactory repositories
-         mavenSettingsConfig: '0e94d6c3-b431-434f-a201-7d7cda7180cb',
-        // we do not need to set a special local maven repo, take the one from the standard box
-        //mavenLocalRepo: '.repository'
+        //mavenLocalRepo: '/tmp/m2'
         ) {
-        // Run the maven build
-        sh "mvn $args -Dmaven.test.failure.ignore"
-    }
+ 
+      // Run the maven build
+      sh "mvn $args -Dmaven.test.failure.ignore -Dmaven.repo.local=/cache"
+     }
 }
 
-def herokuDeploy (herokuApp) {
-    withCredentials([[$class: 'StringBinding', credentialsId: 'HEROKU_API_KEY', variable: 'HEROKU_API_KEY']]) {
-        mvn "heroku:deploy -DskipTests=true -Dmaven.javadoc.skip=true -B -V -D heroku.appName=${herokuApp}"
-    }
+def shareM2(file) {
+    // Set up a shared Maven repo so we don't need to download all dependencies on every build.
+    writeFile file: 'settings.xml',
+    text: "<settings><localRepository>${file}</localRepository></settings>"
 }
 
 def getRepoSlug() {
@@ -306,7 +281,7 @@ def getBranch() {
 def createDeployment(ref, environment, description) {
     withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
         def payload = JsonOutput.toJson(["ref": "${ref}", "description": "${description}", "environment": "${environment}", "required_contexts": []])
-        def apiUrl = "https://api.github.com/repos/${getRepoSlug()}/deployments"
+        def apiUrl = "https://octodemo.com/api/v3/repos/${getRepoSlug()}/deployments"
         def response = sh(returnStdout: true, script: "curl -s -H \"Authorization: Token ${env.GITHUB_TOKEN}\" -H \"Accept: application/json\" -H \"Content-type: application/json\" -X POST -d '${payload}' ${apiUrl}").trim()
         def jsonSlurper = new JsonSlurper()
         def data = jsonSlurper.parseText("${response}")
@@ -314,30 +289,20 @@ def createDeployment(ref, environment, description) {
     }
 }
 
-void createRelease(tagName, createdAt) {
-    withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
-        def body = "**Created at:** ${createdAt}\n**Deployment job:** [${env.BUILD_NUMBER}](${env.BUILD_URL})\n**Environment:** [${env.HEROKU_PRODUCTION}](https://dashboard.heroku.com/apps/${env.HEROKU_PRODUCTION})"
-        def payload = JsonOutput.toJson(["tag_name": "v${tagName}", "name": "${env.HEROKU_PRODUCTION} - v${tagName}", "body": "${body}"])
-        def apiUrl = "https://api.github.com/repos/${getRepoSlug()}/releases"
-        def response = sh(returnStdout: true, script: "curl -s -H \"Authorization: Token ${env.GITHUB_TOKEN}\" -H \"Accept: application/json\" -H \"Content-type: application/json\" -X POST -d '${payload}' ${apiUrl}").trim()
-    }
-}
-
 void setDeploymentStatus(deploymentId, state, targetUrl, description) {
     withCredentials([[$class: 'StringBinding', credentialsId: 'GITHUB_TOKEN', variable: 'GITHUB_TOKEN']]) {
         def payload = JsonOutput.toJson(["state": "${state}", "target_url": "${targetUrl}", "description": "${description}"])
-        def apiUrl = "https://api.github.com/repos/${getRepoSlug()}/deployments/${deploymentId}/statuses"
+        def apiUrl = "https://octodemo.com/api/v3/repos/${getRepoSlug()}/deployments/${deploymentId}/statuses"
         def response = sh(returnStdout: true, script: "curl -s -H \"Authorization: Token ${env.GITHUB_TOKEN}\" -H \"Accept: application/json\" -H \"Content-type: application/json\" -X POST -d '${payload}' ${apiUrl}").trim()
     }
 }
 
 void setBuildStatus(context, message, state) {
-  // partially hard coded URL because of https://issues.jenkins-ci.org/browse/JENKINS-36961, adjust to your own GitHub instance
   step([
       $class: "GitHubCommitStatusSetter",
       contextSource: [$class: "ManuallyEnteredCommitContextSource", context: context],
-      reposSource: [$class: "ManuallyEnteredRepositorySource", url: "https://octodemo.com/${getRepoSlug()}"],
       errorHandlers: [[$class: "ChangingBuildStatusErrorHandler", result: "UNSTABLE"]],
+      reposSource: [$class: "ManuallyEnteredRepositorySource", url: "https://octodemo.com/${getRepoSlug()}"],
       statusResultSource: [ $class: "ConditionalStatusResultSource", results: [[$class: "AnyBuildResult", message: message, state: state]] ]
   ]);
 }
