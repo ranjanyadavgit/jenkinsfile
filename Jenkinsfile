@@ -7,7 +7,7 @@ podTemplate(label: label, yaml: """
 spec:
       containers:
       - name: mvn
-        image: maven:3.3.9-jdk-8-alpine
+        image: maven:3.3.9-jdk-8
         command:
         - cat
         tty: true
@@ -20,7 +20,7 @@ spec:
           # directory location on host
           path: /tmp
           type: Directory
-""",
+""",    
 {
     node (label) {
       container ('mvn') {
@@ -31,23 +31,32 @@ spec:
         buildInfo = Artifactory.newBuildInfo()
         buildInfo.env.capture = true
 
+        (ref, commit) = checkout()
         // pull request or feature branch
-        if  (env.BRANCH_NAME != 'master') {
-            checkout()
-            build()
-            unitTest()
+        if  (env.BRANCH_NAME != 'master' && env.BRANCH_NAME != 'main') {
             // test whether this is a regular branch build or a merged PR build
             if (!isPRMergeBuild()) {
-                // maybe disabled for ChatOps
+                // branch build
+                codeQl = false
+                build()
+                unitTest()
                 preview()
             } else {
                 // PR-build
-                sonar()
+                codeQl = true
+                initCodeQL()
+                build()
+                analyzeAndUploadCodeQLResults(ref, commit)  
+                unitTest()
+                // sonar()
             }    
-        } // master branch / production
+        }
         else {
-            checkout()
+            // master/main branch / production
+            codeQl = true
+            initCodeQL()
             build()
+            analyzeAndUploadCodeQLResults(ref, commit)
             allTests()
             preProduction()
             manualPromotion()
@@ -57,23 +66,58 @@ spec:
  }
 })
 
+def installCodeQL() {
+      sh 'cd /tmp && test -f /tmp/codeql-runner-linux || curl -O -L  https://github.com/github/codeql-action/releases/download/codeql-bundle-20201106/codeql-runner-linux'
+      sh 'chmod a+x /tmp/codeql-runner-linux'
+}
+
+def initCodeQL() {
+      stage 'Init CodeQL'
+      installCodeQL()
+      withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'ghe_token')]) {
+            sh "/tmp/codeql-runner-linux init --repository ${getRepoSlug()} --github-url https://octodemo.com --github-auth \$ghe_token --languages java,javascript"
+      }
+}
+
+def analyzeAndUploadCodeQLResults(ref, commit) {
+      stage 'Analyze & Upload CodeQL results'
+      withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'ghe_token')]) {
+            sh "/tmp/codeql-runner-linux analyze --repository ${getRepoSlug()} --github-url https://octodemo.com --github-auth \$ghe_token  --ref ${ref} --commit  ${commit}"
+      } 
+}
+
 def isPRMergeBuild() {
     return (env.BRANCH_NAME ==~ /^PR-\d+$/)
 }
 
+def getPRNumber() {
+    def matcher = (env.BRANCH_NAME =~ /^PR-(?<PR>\d+)$/)
+    assert matcher.matches()
+    return matcher.group("PR")
+}
+
+// in order for CodeQL to publish its results for PRs, the special ref refs/pull<PR>/merge has to get retrieved while checking out
+// this can be done by telling Jenkins to add the following ref spec: +refs/pull/*/merge:refs/remotes/@{remote}/refs/pull/*/merge
 def checkout () {
     stage 'Checkout code'
     context="continuous-integration/jenkins/"
     context += isPRMergeBuild()?"pr-merge/checkout":"branch/checkout"
-    checkout scm
+    def scmVars = checkout scm
     setBuildStatus ("${context}", 'Checking out completed', 'SUCCESS')
+    if (isPRMergeBuild()) {
+      prMergeRef = "refs/pull/${getPRNumber()}/merge"
+      mergeCommit=sh(returnStdout: true, script: "git show-ref ${prMergeRef} | cut -f 1 -d' '")
+      echo "Merge commit: ${mergeCommit}"
+      return [prMergeRef, mergeCommit]
+    } else {
+      return ["refs/heads/${env.BRANCH_NAME}", scmVars.GIT_COMMIT]    
+    }
 }
 
 def build () {
     stage 'Build'
     mvn 'clean install -DskipTests=true -Dmaven.javadoc.skip=true -Dcheckstyle.skip=true -B -V'
 }
-
 
 def unitTest() {
     stage 'Unit tests'
@@ -199,8 +243,8 @@ def switchSnapshotBuildToRelease() {
 
 def buildAndPublishToArtifactory() {       
         def rtMaven = Artifactory.newMavenBuild()
-        rtMaven.tool = null
-        withEnv(["MAVEN_HOME=/usr/share/maven"]) {
+        // rtMaven.tool = null
+         withEnv(["MAVEN_HOME=/usr/share/maven", "JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk/jre"]) {
            rtMaven.deployer releaseRepo:'libs-release-local', snapshotRepo:'libs-snapshot-local', server: server
            rtMaven.resolver releaseRepo:'libs-release', snapshotRepo:'libs-snapshot', server: server
            rtMaven.run pom: 'pom.xml', goals: 'install', buildInfo: buildInfo
@@ -255,7 +299,11 @@ def mvn(args) {
         ) {
  
       // Run the maven build
-      sh "mvn $args -Dmaven.test.failure.ignore -Dmaven.repo.local=/cache"
+          if (codeQl) {
+            sh ". codeql-runner/codeql-env.sh && mvn $args -Dmaven.test.failure.ignore -Dmaven.repo.local=/cache"
+          } else {
+            sh "mvn $args -Dmaven.test.failure.ignore -Dmaven.repo.local=/cache"
+          }
      }
 }
 
