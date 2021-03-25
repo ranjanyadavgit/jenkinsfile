@@ -75,7 +75,7 @@ def initCodeQL() {
       stage 'Init CodeQL'
       installCodeQL()
       withCredentials([string(credentialsId: 'GITHUB_TOKEN', variable: 'ghe_token')]) {
-            sh "/tmp/codeql-runner-linux init --repository ${getRepoSlug()} --github-url https://octodemo.com --github-auth \$ghe_token --languages java,javascript"
+            sh "/tmp/codeql-runner-linux init --repository ${getRepoSlug()} --github-url https://octodemo.com --github-auth \$ghe_token --languages java,javascript --config-file: .github/codeq-config.yml"
       }
 }
 
