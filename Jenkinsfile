@@ -67,7 +67,7 @@ spec:
 })
 
 def installCodeQL() {
-      sh 'cd /tmp && test -f /tmp/codeql-runner-linux || curl -O -L  https://github.com/github/codeql-action/releases/download/codeql-bundle-20201106/codeql-runner-linux'
+      sh 'cd /tmp && test -f /tmp/codeql-runner-linux || curl -O -L  https://github.com/github/codeql-action/releases/latest/download/codeql-runner-linux'
       sh 'chmod a+x /tmp/codeql-runner-linux'
 }
 
